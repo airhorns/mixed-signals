@@ -165,6 +165,7 @@ export class ForwardedUpstream {
   private rootSignalIds = new Set<SignalId>();
   private signalSubscriptions = new Map<SignalId, Set<string>>();
   private signalVisibility = new Map<SignalId, Set<string>>();
+  private finalSignalIds = new Set<SignalId>();
 
   constructor(prefix: string, transport: Transport, host: UpstreamHost) {
     this.prefix = prefix;
@@ -207,6 +208,11 @@ export class ForwardedUpstream {
         // Parse params: [signalId, value, mode?]
         const params = parseWireParams(parsed.payload);
         const [signalId, value, mode] = params;
+        if (mode === 'seal') {
+          this.forwardFinalSignal(signalId as SignalId);
+          return;
+        }
+
         const subscribers = this.signalSubscriptions.get(signalId as SignalId);
         const visibleClients = this.signalVisibility.get(signalId as SignalId);
         const recipients =
@@ -277,6 +283,25 @@ export class ForwardedUpstream {
     }
   }
 
+  private forwardFinalSignal(signalId: SignalId) {
+    this.finalSignalIds.add(signalId);
+    const subscribers = this.signalSubscriptions.get(signalId);
+    const recipients =
+      subscribers && subscribers.size > 0
+        ? subscribers
+        : this.signalVisibility.get(signalId);
+    this.signalSubscriptions.delete(signalId);
+    this.signalVisibility.delete(signalId);
+    if (!recipients) return;
+
+    const message = formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
+      `${this.prefix}${SEP}${signalId}`,
+      null,
+      'seal',
+    ]);
+    for (const clientId of recipients) this.host.send(clientId, message);
+  }
+
   /**
    * Forward a method call from a downstream client to the upstream.
    */
@@ -341,10 +366,15 @@ export class ForwardedUpstream {
    */
   forwardWatch(clientId: string, signalIds: SignalId[]) {
     const toWatch: SignalId[] = [];
-
-    this.rememberVisibleSignals(clientId, signalIds);
+    const finalIds: SignalId[] = [];
 
     for (const signalId of new Set(signalIds)) {
+      if (this.finalSignalIds.has(signalId)) {
+        finalIds.push(`${this.prefix}${SEP}${signalId}`);
+        continue;
+      }
+
+      this.rememberVisibleSignals(clientId, [signalId]);
       let subscribers = this.signalSubscriptions.get(signalId);
       const wasUnwatched = !subscribers || subscribers.size === 0;
       if (!subscribers) {
@@ -359,6 +389,16 @@ export class ForwardedUpstream {
     if (toWatch.length > 0) {
       this.transport.send(
         formatNotificationMessage(WATCH_SIGNALS_METHOD, toWatch),
+      );
+    }
+    for (const signalId of finalIds) {
+      this.host.send(
+        clientId,
+        formatNotificationMessage(SIGNAL_UPDATE_METHOD, [
+          signalId,
+          null,
+          'seal',
+        ]),
       );
     }
   }

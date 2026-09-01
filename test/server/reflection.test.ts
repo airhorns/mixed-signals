@@ -1,8 +1,9 @@
 import {signal} from '@preact/signals-core';
-import {beforeEach, describe, expect, it} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {Instances} from '../../server/instances.ts';
 import {Reflection} from '../../server/reflection.ts';
 import {
+  formatNotificationMessage,
   parseWireMessage,
   parseWireParams,
   SIGNAL_UPDATE_METHOD,
@@ -54,6 +55,76 @@ describe('Reflection', () => {
     sender = new FakeSender();
     instances = new Instances();
     reflection = new Reflection(sender, instances);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe('final signals', () => {
+    it('serializes a final signal with the f flag and never subscribes to it', () => {
+      reflection.registerModel('Counter', Counter);
+      const c = new Counter();
+      instances.register('0', c);
+      reflection.markFinal([c.name]);
+
+      const serialized = reflection.serialize(c, 'c1');
+
+      expect(serialized.name).toEqual({
+        '@S': serialized.name['@S'],
+        v: 'default',
+        f: 1,
+      });
+      expect(serialized.count).not.toHaveProperty('f');
+
+      reflection.watch('c1', serialized.name['@S']);
+      c.name.value = 'changed';
+      expect(sender.sent).toEqual([]);
+    });
+
+    it('debounces seal notifications while unsubscribing immediately', () => {
+      vi.useFakeTimers();
+      const {counter, countId, nameId} = setupCounter(
+        reflection,
+        instances,
+        'c1',
+      );
+      reflection.serialize(counter, 'c2');
+      reflection.serialize(counter, 'c3');
+      reflection.unwatch('c3', countId);
+
+      reflection.markFinal([counter.count]);
+      reflection.markFinal([counter.name]);
+
+      expect(vi.getTimerCount()).toBe(1);
+      expect(sender.sent).toEqual([]);
+
+      counter.count.value = 99;
+      expect(sender.sent).toEqual([]);
+
+      vi.advanceTimersByTime(1_000);
+
+      const sealFrame = (id: number) =>
+        formatNotificationMessage(SIGNAL_UPDATE_METHOD, [id, null, 'seal']);
+      expect(sender.sent).toEqual([
+        {clientId: 'c1', message: sealFrame(countId)},
+        {clientId: 'c1', message: sealFrame(nameId)},
+        {clientId: 'c2', message: sealFrame(countId)},
+        {clientId: 'c2', message: sealFrame(nameId)},
+        {clientId: 'c3', message: sealFrame(nameId)},
+      ]);
+    });
+
+    it('re-serializes a final signal inline instead of as a held ref', () => {
+      vi.useFakeTimers();
+      const {counter, serialized} = setupCounter(reflection, instances, 'c1');
+      reflection.watch('c1', serialized.count['@S']);
+      reflection.markFinal([counter.count]);
+
+      const again = reflection.serialize(counter.count, 'c1');
+
+      expect(again).toEqual({'@S': serialized.count['@S'], v: 0, f: 1});
+    });
   });
 
   describe('model registration', () => {
@@ -525,8 +596,8 @@ describe('Reflection', () => {
       counter.items.value = ['x', 'y'];
       const relevant = sender.sent.filter((m) => m.clientId === clientId);
       expect(relevant.length).toBeGreaterThan(0);
-      const last = relevant[relevant.length - 1].message;
-      expect(last).not.toContain('"append"');
+      const [, , mode] = parseUpdate(relevant[relevant.length - 1].message);
+      expect(mode).toBeUndefined();
     });
 
     it('sends delta for object merge', () => {
@@ -566,9 +637,8 @@ describe('Reflection', () => {
       counter.name.value = 'completely different';
       const relevant = sender.sent.filter((m) => m.clientId === clientId);
       expect(relevant.length).toBeGreaterThan(0);
-      const last = relevant[relevant.length - 1].message;
-      expect(last).not.toContain('"append"');
-      expect(last).not.toContain('"merge"');
+      const [, , mode] = parseUpdate(relevant[relevant.length - 1].message);
+      expect(mode).toBeUndefined();
     });
 
     it('sends merge delta when a key is added', () => {

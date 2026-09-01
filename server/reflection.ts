@@ -9,6 +9,8 @@ type SignalId = number;
 type ClientId = string;
 type DeltaMode = 'append' | 'merge';
 
+const FINAL_NOTIFICATION_DELAY = 1_000;
+
 interface RpcSender {
   send(clientId: string, message: string): void;
 }
@@ -35,6 +37,9 @@ export class Reflection {
   private subscriptions = new Map<SignalId, Set<ClientId>>();
   private signalUnsubscribers = new Map<SignalId, () => void>();
   private lastSentValues = new Map<string, any>();
+  private finalSignals = new WeakSet<Signal<any>>();
+  private pendingFinalSignals = new Map<ClientId, Set<SignalId>>();
+  private finalNotificationTimer: ReturnType<typeof setTimeout> | undefined;
   private sentModels = new Map<ClientId, Set<string>>();
   private nextSignalId = 1;
   private rpc: RpcSender;
@@ -112,6 +117,12 @@ export class Reflection {
     if (value instanceof Signal) {
       const id = this.getSignalId(value);
       const signalValue = value.peek();
+
+      if (this.finalSignals.has(value)) {
+        // Always inlined: an unwatched signal is only weakly held client-side,
+        // so a bare ref could fail to resolve.
+        return {'@S': id, v: this.serializeValue(signalValue, clientId), f: 1};
+      }
 
       if (clientId) {
         const key = `${clientId}:${id}`;
@@ -239,7 +250,53 @@ export class Reflection {
     return this.serialize(instance, clientId);
   }
 
+  markFinal(signals: Iterable<Signal<any>>) {
+    for (const sig of signals) {
+      if (this.finalSignals.has(sig)) continue;
+      this.finalSignals.add(sig);
+
+      const id = this.signalIds.get(sig);
+      if (id === undefined) continue;
+      const subs = this.subscriptions.get(id);
+      if (!subs) continue;
+
+      for (const clientId of subs) {
+        let ids = this.pendingFinalSignals.get(clientId);
+        if (!ids) this.pendingFinalSignals.set(clientId, (ids = new Set()));
+        ids.add(id);
+      }
+      this.subscriptions.delete(id);
+      this.signalUnsubscribers.get(id)?.();
+      this.signalUnsubscribers.delete(id);
+    }
+
+    if (this.pendingFinalSignals.size > 0 && !this.finalNotificationTimer) {
+      this.finalNotificationTimer = setTimeout(
+        () => this.flushFinalNotifications(),
+        FINAL_NOTIFICATION_DELAY,
+      );
+    }
+  }
+
+  private flushFinalNotifications() {
+    this.finalNotificationTimer = undefined;
+    const pending = this.pendingFinalSignals;
+    this.pendingFinalSignals = new Map();
+
+    for (const [clientId, ids] of pending) {
+      for (const id of ids) {
+        this.rpc.send(
+          clientId,
+          formatNotificationMessage(SIGNAL_UPDATE_METHOD, [id, null, 'seal']),
+        );
+      }
+    }
+  }
+
   watch(clientId: ClientId, signalId: SignalId) {
+    const sig = this.signals.get(signalId);
+    if (sig && this.finalSignals.has(sig)) return;
+
     let subs = this.subscriptions.get(signalId);
     if (!subs) {
       subs = new Set();
@@ -247,25 +304,20 @@ export class Reflection {
     }
 
     subs.add(clientId);
+    if (!sig) return;
 
     if (!this.signalUnsubscribers.has(signalId)) {
-      const sig = this.signals.get(signalId);
-      if (sig) {
-        // The server only subscribes to source signals once a client cares.
-        // Subscribing notifies immediately, which doubles as catch-up for
-        // this first watcher.
-        const unsubscribe = sig.subscribe(() => {
-          this.notifySubscribers(signalId);
-        });
-        this.signalUnsubscribers.set(signalId, unsubscribe);
-      }
+      // The server only subscribes to source signals once a client cares.
+      // Subscribing notifies immediately, which doubles as catch-up for
+      // this first watcher.
+      const unsubscribe = sig.subscribe(() => {
+        this.notifySubscribers(signalId);
+      });
+      this.signalUnsubscribers.set(signalId, unsubscribe);
     } else {
       // A live subscription only forwards future changes. A client joining it
       // may have missed updates while unwatched, so send a catch-up delta.
-      const sig = this.signals.get(signalId);
-      if (sig) {
-        this.sendUpdateIfChanged(clientId, signalId, sig.peek());
-      }
+      this.sendUpdateIfChanged(clientId, signalId, sig.peek());
     }
   }
 
@@ -286,6 +338,7 @@ export class Reflection {
     }
 
     this.sentModels.delete(clientId);
+    this.pendingFinalSignals.delete(clientId);
   }
 
   private disposeSignalIfUnwatched(signalId: SignalId) {
@@ -347,7 +400,10 @@ export class Reflection {
         newValue.length > oldValue.length &&
         oldValue.every((value, index) => value === newValue[index])
       ) {
-        return {value: newValue.slice(oldValue.length), mode: 'append'};
+        return {
+          value: newValue.slice(oldValue.length),
+          mode: 'append',
+        };
       }
       // Same length, same elements — no update needed.
       if (
@@ -396,7 +452,10 @@ export class Reflection {
       newValue.startsWith(oldValue)
     ) {
       if (newValue.length === oldValue.length) return null;
-      return {value: newValue.slice(oldValue.length), mode: 'append'};
+      return {
+        value: newValue.slice(oldValue.length),
+        mode: 'append',
+      };
     }
 
     return {value: newValue};
