@@ -629,6 +629,60 @@ export class ClientReflection {
     if (this.finalSignals.has(from)) this.markSignalFinal(to);
   }
 
+  /** Prepare missing model snapshots before a message exposes their facades. */
+  prepareModelReferences(
+    value: unknown,
+    refresh: (markers: string[]) => Promise<any>,
+  ) {
+    const state = {
+      snapshots: [] as unknown[],
+      heldModels: [] as object[],
+      ready: undefined as Promise<void> | undefined,
+    };
+    const complete = new Set<string>();
+    const referenced = new Set<string>();
+    const visit = (value: any) => {
+      if (!value || typeof value !== 'object') return;
+      if (typeof value['@M'] === 'string') {
+        const marker = value['@M'];
+        referenced.add(marker);
+        if (Object.keys(value).some((key) => key !== '@M')) {
+          complete.add(marker);
+        }
+        const model = this.getModel(marker);
+        if (model) {
+          complete.add(marker);
+          state.heldModels.push(model);
+        }
+      }
+      for (const child of Object.values(value)) visit(child);
+    };
+    const missing = () =>
+      [...referenced].filter((marker) => !complete.has(marker));
+    const hydrate = async (markers: string[]) => {
+      while (markers.length) {
+        const snapshots = await refresh(markers);
+        if (!Array.isArray(snapshots) || snapshots.length !== markers.length) {
+          throw new Error('Invalid model refresh response');
+        }
+        for (let i = 0; i < markers.length; i++) {
+          if (snapshots[i]?.['@M'] !== markers[i]) {
+            throw new Error(`Model unavailable: ${markers[i]}`);
+          }
+          // A refresh result is complete even for a model with only methods.
+          complete.add(markers[i]);
+        }
+        state.snapshots.push(...snapshots);
+        visit(snapshots);
+        markers = missing();
+      }
+    };
+    visit(value);
+    const markers = missing();
+    if (markers.length) state.ready = hydrate(markers);
+    return state;
+  }
+
   createModelFacade(serialized: any): any {
     const raw: string = serialized['@M'];
     if (!raw) {
