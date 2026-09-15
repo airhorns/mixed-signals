@@ -1,11 +1,10 @@
-import {batch, type Signal} from '@preact/signals-core';
+import type {Signal} from '@preact/signals-core';
 import {
   type ConnectionInfo,
   formatCallMessage,
   formatErrorMessage,
   formatNotificationMessage,
   formatResultMessage,
-  type ParsedWireMessage,
   parseWireMessage,
   parseWireParams,
   parseWireValue,
@@ -63,12 +62,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
   private nextId = 1;
   private pending = new Map<
     number,
-    {
-      resolve: (v: any) => void;
-      reject: (e: any) => void;
-      sentAt: number;
-      raw: boolean;
-    }
+    {resolve: (v: any) => void; reject: (e: any) => void; sentAt: number}
   >();
   private staleTimeout: number | false;
   private staleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -160,7 +154,19 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     transport.onOpen?.(() => this.handleOpen(generation));
     transport.onClose?.((error) => this.handleDisconnect(generation, error));
 
-    const deliver = (message: ParsedWireMessage, snapshots: unknown[]) => {
+    transport.onMessage((data) => {
+      if (
+        generation !== this.transportGeneration ||
+        transport !== this.transport
+      ) {
+        return;
+      }
+
+      this.lastInboundAt = Date.now();
+
+      const message = parseWireMessage(data.toString());
+      if (!message) return;
+
       const reviver = (_key: string, val: any) => {
         if (typeof val === 'object' && val) {
           if ('@S' in val) {
@@ -178,10 +184,6 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
 
         return val;
       };
-
-      for (const snapshot of snapshots) {
-        JSON.parse(JSON.stringify(snapshot), reviver);
-      }
 
       if (message.type === 'result' || message.type === 'error') {
         const parsed = parseWireValue(message.payload, reviver);
@@ -219,120 +221,23 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
         return;
       }
 
-      const params = parseWireParams(message.payload, reviver);
-      this.handleNotification(generation, message.method, params);
-    };
-    type QueuedMessage = {
-      message: ParsedWireMessage;
-      disconnect: Promise<never>;
-    };
-    const queue: QueuedMessage[] = [];
-    let hydrating = false;
-    const isCurrent = (entry: QueuedMessage) =>
-      generation === this.transportGeneration &&
-      transport === this.transport &&
-      entry.disconnect === this.disconnectPromise &&
-      !this.closed;
-    const fail = (message: ParsedWireMessage, error: unknown) => {
-      if (message.type === 'result' || message.type === 'error') {
-        this.pending.get(message.id)?.reject(error);
-        this.pending.delete(message.id);
-        if (!this.pending.size) this.clearStaleTimer();
-      } else if (message.type === 'call') {
-        this.sendOnTransport(
-          generation,
-          transport,
-          formatErrorMessage(message.id, {
-            code: -1,
-            message: error instanceof Error ? error.message : String(error),
-          }),
-        );
-      } else {
-        this.handleDisconnect(generation, error);
-        transport.close?.();
+      if (message.method === ROOT_NOTIFICATION_METHOD) {
+        const rawParams = parseWireParams(message.payload);
+        this.prepareForRootSnapshot(rawParams);
       }
-    };
-    const drain = () => {
-      while (!hydrating && queue.length) {
-        const entry = queue.shift()!;
-        if (!isCurrent(entry)) continue;
-        const {message} = entry;
-        try {
-          const value =
-            message.type === 'result' || message.type === 'error'
-              ? parseWireValue(message.payload)
-              : parseWireParams(message.payload);
-          const rootSnapshot =
-            message.type === 'notification' &&
-            message.method === ROOT_NOTIFICATION_METHOD;
-          if (rootSnapshot) this.prepareForRootSnapshot(value as unknown[]);
-          const hydration = this.reflection.prepareModelReferences(
-            value,
-            (markers) => this.request(REFRESH_MODELS_METHOD, markers, true),
-          );
-          const apply = () => {
-            if (!isCurrent(entry)) return;
-            batch(() => {
-              if (rootSnapshot) this.reflection.beginRootSnapshot();
-              try {
-                deliver(message, hydration.snapshots);
-              } finally {
-                if (rootSnapshot) this.reflection.endRootSnapshot();
-              }
-            });
-          };
-          if (!hydration.ready) {
-            apply();
-            continue;
-          }
-          hydrating = true;
-          void hydration.ready
-            .then(apply)
-            .catch((error) => {
-              if (isCurrent(entry)) fail(message, error);
-            })
-            .finally(() => {
-              hydrating = false;
-              drain();
-            });
-        } catch (error) {
-          fail(message, error);
-        }
-      }
-    };
 
-    transport.onMessage((data) => {
-      if (
-        generation !== this.transportGeneration ||
-        transport !== this.transport ||
-        this.closed
-      )
-        return;
-      this.lastInboundAt = Date.now();
-      const message = parseWireMessage(data.toString());
-      if (!message) return;
-      if (message.type === 'result' || message.type === 'error') {
-        const pending = this.pending.get(message.id);
-        if (!pending) return;
-        // Refresh replies bypass the delivery queue that is waiting for them.
-        if (pending.raw) {
-          try {
-            const value = parseWireValue(message.payload);
-            if (message.type === 'result') pending.resolve(value);
-            else {
-              const {message: errorMessage, ...props} = (value ?? {}) as any;
-              pending.reject(Object.assign(new Error(errorMessage), props));
-            }
-          } catch (error) {
-            pending.reject(error);
-          }
-          this.pending.delete(message.id);
-          if (!this.pending.size) this.clearStaleTimer();
-          return;
+      let params: unknown[];
+      if (message.method === ROOT_NOTIFICATION_METHOD) {
+        this.reflection.beginRootSnapshot();
+        try {
+          params = parseWireParams(message.payload, reviver);
+        } finally {
+          this.reflection.endRootSnapshot();
         }
+      } else {
+        params = parseWireParams(message.payload, reviver);
       }
-      queue.push({message, disconnect: this.disconnectPromise});
-      drain();
+      this.handleNotification(generation, message.method, params);
     });
   }
 
@@ -459,15 +364,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
       );
   }
 
-  call(method: string, params?: any): Promise<any> {
-    return this.request(method, params);
-  }
-
-  private async request(
-    method: string,
-    params?: any,
-    raw = false,
-  ): Promise<any> {
+  async call(method: string, params?: any): Promise<any> {
     if (this.closed) {
       throw this.getDisconnectError();
     }
@@ -492,15 +389,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     }
 
     return new Promise((resolve, reject) => {
-      this.sendCall(
-        generation,
-        transport,
-        method,
-        params,
-        resolve,
-        reject,
-        raw,
-      );
+      this.sendCall(generation, transport, method, params, resolve, reject);
     });
   }
 
@@ -526,7 +415,6 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     params: any,
     resolve: (v: any) => void,
     reject: (e: any) => void,
-    raw: boolean,
   ) {
     if (
       this.closed ||
@@ -542,7 +430,7 @@ export class RPCClient<TRoot = DefaultReflectedRoot> {
     }
 
     const id = this.nextId++;
-    this.pending.set(id, {resolve, reject, sentAt: Date.now(), raw});
+    this.pending.set(id, {resolve, reject, sentAt: Date.now()});
     transport.send(formatCallMessage(id, method, params || []));
     this.watchForStaleTransport(generation);
   }

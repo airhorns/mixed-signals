@@ -2,5 +2,5 @@
 "mixed-signals": patch
 ---
 
-Refresh model references whose client facades have been garbage-collected before delivering RPC results, notifications, or peer calls.
-Preserve message order during recovery and propagate refresh failures without exposing incomplete models.
+Unwatching a signal now discards its last-sent value and the client's saved model state on the server.
+The next watch sends a full value, and affected models include their fields when sent again.
